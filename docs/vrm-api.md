@@ -211,6 +211,18 @@ Alle velden in `records`:
 | `vrm_to_grid_fc` / `vrm_to_battery_fc` | gepland naar net (negatief = import) / naar accu | Wh |
 | `vrm_ffcs` | uren geforceerd volladen (periodic full charge); vrijwel altijd 0 | — |
 
+`vrm_to_grid_fc` is de **geplande netto netstroom** per uur: positief = export naar net,
+negatief = import van net. Empirisch bewezen (2026-07-29): per uur geldt exact
+`vrm_to_grid_fc = solar_yield_forecast − vrm_consumption_fc − vrm_to_battery_fc`, en de reeks
+is negatief in nachturen zonder zon. Een apart from-grid-forecastveld bestaat niet; dit ene
+veld levert dus beide **toekomstige €-stromen** voor een verwacht dagresultaat:
+
+- **Verwachte opbrengst** = Σ over toekomstige uren van max(0, `vrm_to_grid_fc`)/1000 × `deGs`
+- **Verwachte kosten** = Σ over toekomstige uren van max(0, −`vrm_to_grid_fc`)/1000 × `deGb`
+
+De prijsreeksen `deGb`/`deGs` beslaan het hele opgevraagde venster (ook toekomstige uren),
+dus de €-schatting heeft geen extra call nodig. In HA: `sensor.vrm_resultaat_verwacht`.
+
 ### €-tegels "Kosten en besparingen" (geen apart endpoint!)
 
 Het dashboard doet **geen** aparte API-call voor de vier €-tegels; ze worden client-side uit

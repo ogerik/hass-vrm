@@ -291,6 +291,19 @@ sections:
         grid_options: { columns: 6 }
         content: "**Net kosten**\n\n# € {{ state_attr('sensor.vrm_dess','grid_costs') }}\n\n*Betaald voor inkoop van het net.*"
 
+      # -- Resultaat verwacht (alleen bij vandaag): gerealiseerd tot nu + VRM's
+      # geplande resterende uren (vrm_to_grid_fc × deGs/deGb, package-sensor).
+      # Geschat — het DESS-plan wordt elk uur bijgesteld.
+      - type: conditional
+        grid_options: { columns: full }
+        conditions:
+          - condition: state
+            entity: binary_sensor.vrm_datum_is_vandaag
+            state: "on"
+        card:
+          type: markdown
+          content: "**Resultaat verwacht (vandaag)**\n\n# € {{ states('sensor.vrm_resultaat_verwacht') }}\n\n*Geschat: € {{ state_attr('sensor.vrm_resultaat_verwacht','gerealiseerd') }} gerealiseerd + € {{ state_attr('sensor.vrm_resultaat_verwacht','verwachte_opbrengst') }} verwachte opbrengst − € {{ state_attr('sensor.vrm_resultaat_verwacht','verwachte_kosten') }} verwachte kosten.*"
+
   # ============ Sectie 3: Planning (alleen bij vandaag) ============
   # Een voorspelling terugkijken heeft geen zin; hele sectie verbergt zichzelf.
   - type: grid

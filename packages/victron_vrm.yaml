@@ -32,6 +32,11 @@
 #   sensor.vrm_zon_verwacht / sensor.vrm_verbruik_verwacht
 #     verwachte dagtotalen (kWh, 1 decimaal) voor VANDAAG uit de uurvoorspellingen;
 #     attribute resterend = zelfde som maar alleen uren vanaf nu
+#   sensor.vrm_resultaat_verwacht
+#     verwacht dagresultaat (€, 2 dec) voor VANDAAG: gerealiseerd tot nu (zelfde
+#     formule als total_result) + resterende uren uit VRM's eigen DESS-plan
+#     (vrm_to_grid_fc × deGs/deGb); attributes gerealiseerd /
+#     verwachte_opbrengst / verwachte_kosten
 #   input_datetime.vrm_datum — de gekozen dag (datumkiezer op het VRM-dashboard)
 #   binary_sensor.vrm_datum_is_vandaag — on als de gekozen dag vandaag is (of de input leeg/unknown)
 #   script.vrm_naar_vandaag — zet de datumkiezer terug op vandaag
@@ -168,6 +173,9 @@ rest:
           - total_battery_flow
           - total_solar_yield
           - total_consumption
+          # geplande netto netstroom (Wh, + = export / − = import), voor
+          # sensor.vrm_resultaat_verwacht
+          - vrm_to_grid_fc
 
 template:
   # ---- Datum-hulpsensor: is de gekozen dag vandaag? ----
@@ -224,6 +232,62 @@ template:
         entity_id: sensor.vrm_forecast_raw
       - trigger: homeassistant
         event: start
+    # Variabelen voor sensor.vrm_resultaat_verwacht (onderaan dit blok).
+    # vrm_to_grid_fc = VRM's geplande netto netstroom per uur in Wh, + = export
+    # naar net, − = import van net (empirisch 2026-07-29: per uur exact gelijk
+    # aan solar_yield_forecast − vrm_consumption_fc − vrm_to_battery_fc, en
+    # negatief in nachturen zonder zon). Een apart from-grid-forecastveld
+    # bestaat niet in de API; dit ene veld levert dus beide toekomstige
+    # €-stromen — dichter bij VRM's eigen planning kun je niet komen.
+    action:
+      - variables:
+          # Venster van de schatting: vandaag 00:00–24:00 lokaal, plus "nu".
+          rv_t0: "{{ (as_timestamp(today_at()) * 1000) | int }}"
+          rv_t1: "{{ ((as_timestamp(today_at()) * 1000) | int) + 86400000 }}"
+          rv_now: "{{ (as_timestamp(now()) * 1000) | int }}"
+          rv_fc: "{{ state_attr('sensor.vrm_dess_raw', 'vrm_to_grid_fc') or [] }}"
+          rv_gb: "{{ state_attr('sensor.vrm_dess_raw', 'deGb') or [] }}"
+          rv_gs: "{{ state_attr('sensor.vrm_dess_raw', 'deGs') or [] }}"
+          rv_bc: "{{ state_attr('sensor.vrm_dess_raw', 'deBc') or [] }}"
+          rv_ghf: "{{ state_attr('sensor.vrm_dess_raw', 'grid_history_from') or [] }}"
+          rv_ght: "{{ state_attr('sensor.vrm_dess_raw', 'grid_history_to') or [] }}"
+          rv_bf: "{{ state_attr('sensor.vrm_dess_raw', 'total_battery_flow') or [] }}"
+          # Gerealiseerd tot nu: zelfde formule als total_result op sensor.vrm_dess
+          # (besparing − netkosten − accukosten, elk op 2 dec), maar vast op
+          # VANDAAG — inclusief accukosten, zodat hij bij datumkeuze "vandaag"
+          # exact matcht met de tegel "Totaal resultaat".
+          rv_ger: >-
+            {% set ns = namespace(s=0.0, g=0.0, b=0.0) %}
+            {% for p in rv_ght if p[1] is not none and p[0] >= rv_t0 | int and p[0] < rv_t1 | int %}
+              {% set price = rv_gs | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.s = ns.s + p[1] * price %}
+            {% endfor %}
+            {% for p in rv_ghf if p[1] is not none and p[0] >= rv_t0 | int and p[0] < rv_t1 | int %}
+              {% set price = rv_gb | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.g = ns.g + p[1] * price %}
+            {% endfor %}
+            {% for p in rv_bf if p[1] is not none and p[0] >= rv_t0 | int and p[0] < rv_t1 | int %}
+              {% set c = rv_bc | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.b = ns.b + c %}
+            {% endfor %}
+            {{ ((ns.s | round(2)) - (ns.g | round(2)) - (ns.b | round(2))) | round(2) }}
+          # Toekomst: alleen resterende uren van vandaag (ts >= nu; het lopende
+          # uur telt bij "gerealiseerd", zelfde conventie als de resterend-
+          # attributes hierboven). Wh → kWh; export × deGs resp. import × deGb.
+          rv_opb: >-
+            {% set ns = namespace(t=0.0) %}
+            {% for p in rv_fc if p[1] is not none and p[1] > 0 and p[0] >= rv_now | int and p[0] < rv_t1 | int %}
+              {% set price = rv_gs | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.t = ns.t + (p[1] / 1000) * price %}
+            {% endfor %}
+            {{ ns.t | round(2) }}
+          rv_kos: >-
+            {% set ns = namespace(t=0.0) %}
+            {% for p in rv_fc if p[1] is not none and p[1] < 0 and p[0] >= rv_now | int and p[0] < rv_t1 | int %}
+              {% set price = rv_gb | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.t = ns.t + ((p[1] | abs) / 1000) * price %}
+            {% endfor %}
+            {{ ns.t | round(2) }}
     sensor:
       - name: "VRM zon verwacht"
         unique_id: vrm_zon_verwacht
@@ -275,6 +339,19 @@ template:
               {% endif %}
             {% endfor %}
             {{ ns.t | round(1) }}
+      # GESCHAT verwacht dagresultaat (€) voor vandaag — gerealiseerd tot nu +
+      # VRM's geplande resterende uren; wijkt af van wat VRM uiteindelijk
+      # realiseert (plan wordt elk uur bijgesteld). Formules in de variables
+      # hierboven (rv_ger / rv_opb / rv_kos).
+      - name: "VRM resultaat verwacht"
+        unique_id: vrm_resultaat_verwacht
+        unit_of_measurement: "€"
+        icon: mdi:chart-line
+        state: "{{ ((rv_ger | float(0)) + (rv_opb | float(0)) - (rv_kos | float(0))) | round(2) }}"
+        attributes:
+          gerealiseerd: "{{ rv_ger | float(0) }}"
+          verwachte_opbrengst: "{{ rv_opb | float(0) }}"
+          verwachte_kosten: "{{ rv_kos | float(0) }}"
 
   # ---- Interface 2: sensor.vrm_dess (SOC-plan, accu-flow + afgeleide €-reeks en €-totalen) ----
   # Formules uit docs/vrm-api.md ("€-tegels"): per uur export×deGs − import×deGb;
