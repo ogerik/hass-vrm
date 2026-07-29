@@ -194,6 +194,25 @@ sections:
                 entity: sensor.energieprijzen
                 name: Prijs nu
 
+      # -- Geschat dagoverzicht (alleen bij vandaag): verwachte dagtotalen zon en
+      # verbruik uit de uurvoorspellingen (package-sensoren), in de vaste
+      # €-tegel-stijl. Op een historische datum verbergt de conditional de rij.
+      - type: conditional
+        grid_options: { columns: full }
+        conditions:
+          - condition: state
+            entity: binary_sensor.vrm_datum_is_vandaag
+            state: "on"
+        card:
+          type: grid
+          columns: 2
+          square: false
+          cards:
+            - type: markdown
+              content: "**Zon verwacht**\n\n# {{ states('sensor.vrm_zon_verwacht') }} kWh\n\n*Dagvoorspelling; nog {{ state_attr('sensor.vrm_zon_verwacht','resterend') }} kWh te komen.*"
+            - type: markdown
+              content: "**Verbruik verwacht**\n\n# {{ states('sensor.vrm_verbruik_verwacht') }} kWh\n\n*Dagvoorspelling; nog {{ state_attr('sensor.vrm_verbruik_verwacht','resterend') }} kWh te komen.*"
+
   # ============ Sectie 2: Dynamic ESS — kosten en besparingen ============
   - type: grid
     cards:

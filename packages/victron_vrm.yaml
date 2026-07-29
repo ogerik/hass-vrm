@@ -29,6 +29,9 @@
 #   sensor.energieprijzen
 #     prices  [{"timestamp": "YYYY-MM-DD HH:MM:SS+00:00", "price": €/kWh}, ...]
 #     state = huidige uurprijs in €/kWh
+#   sensor.vrm_zon_verwacht / sensor.vrm_verbruik_verwacht
+#     verwachte dagtotalen (kWh, 1 decimaal) voor VANDAAG uit de uurvoorspellingen;
+#     attribute resterend = zelfde som maar alleen uren vanaf nu
 #   input_datetime.vrm_datum — de gekozen dag (datumkiezer op het VRM-dashboard)
 #   binary_sensor.vrm_datum_is_vandaag — on als de gekozen dag vandaag is (of de input leeg/unknown)
 #   script.vrm_naar_vandaag — zet de datumkiezer terug op vandaag
@@ -210,6 +213,68 @@ template:
               {% set ns.out = ns.out + [[p[0], v]] %}
             {% endfor %}
             {{ ns.out }}
+
+  # ---- Geschat dagoverzicht: verwachte dagtotalen zon en verbruik voor VANDAAG ----
+  # Som van de uurvoorspellingen binnen vandaag 00:00–24:00 (lokaal); attribute
+  # resterend = zelfde som maar alleen uren vanaf nu. Op een historische gekozen
+  # datum valt het venster buiten de attributes en zijn de sensoren 0/leeg — maar
+  # dan zijn de bijbehorende tegels op het dashboard toch verborgen.
+  - trigger:
+      - trigger: state
+        entity_id: sensor.vrm_forecast_raw
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "VRM zon verwacht"
+        unique_id: vrm_zon_verwacht
+        unit_of_measurement: kWh
+        icon: mdi:weather-sunny
+        state: >-
+          {% set t0 = (as_timestamp(today_at()) * 1000) | int %}
+          {% set t1 = t0 + 86400000 %}
+          {% set ns = namespace(t=0.0) %}
+          {% for p in (state_attr('sensor.vrm_forecast_raw', 'solar_yield_forecast') or []) %}
+            {% if p[1] is not none and p[0] >= t0 and p[0] < t1 %}
+              {% set ns.t = ns.t + p[1] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.t | round(1) }}
+        attributes:
+          resterend: >-
+            {% set t1 = ((as_timestamp(today_at()) * 1000) | int) + 86400000 %}
+            {% set now_ms = (as_timestamp(now()) * 1000) | int %}
+            {% set ns = namespace(t=0.0) %}
+            {% for p in (state_attr('sensor.vrm_forecast_raw', 'solar_yield_forecast') or []) %}
+              {% if p[1] is not none and p[0] >= now_ms and p[0] < t1 %}
+                {% set ns.t = ns.t + p[1] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t | round(1) }}
+      - name: "VRM verbruik verwacht"
+        unique_id: vrm_verbruik_verwacht
+        unit_of_measurement: kWh
+        icon: mdi:home-lightning-bolt
+        state: >-
+          {% set t0 = (as_timestamp(today_at()) * 1000) | int %}
+          {% set t1 = t0 + 86400000 %}
+          {% set ns = namespace(t=0.0) %}
+          {% for p in (state_attr('sensor.vrm_forecast_raw', 'vrm_consumption_fc') or []) %}
+            {% if p[1] is not none and p[0] >= t0 and p[0] < t1 %}
+              {% set ns.t = ns.t + p[1] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.t | round(1) }}
+        attributes:
+          resterend: >-
+            {% set t1 = ((as_timestamp(today_at()) * 1000) | int) + 86400000 %}
+            {% set now_ms = (as_timestamp(now()) * 1000) | int %}
+            {% set ns = namespace(t=0.0) %}
+            {% for p in (state_attr('sensor.vrm_forecast_raw', 'vrm_consumption_fc') or []) %}
+              {% if p[1] is not none and p[0] >= now_ms and p[0] < t1 %}
+                {% set ns.t = ns.t + p[1] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t | round(1) }}
 
   # ---- Interface 2: sensor.vrm_dess (SOC-plan, accu-flow + afgeleide €-reeks en €-totalen) ----
   # Formules uit docs/vrm-api.md ("€-tegels"): per uur export×deGs − import×deGb;
