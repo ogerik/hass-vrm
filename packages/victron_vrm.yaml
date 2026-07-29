@@ -1,0 +1,325 @@
+# ============================= AANPASSEN =====================================
+# Dit package komt uit github.com/ogerik/hass-vrm. Drie dingen invullen voor
+# jouw installatie:
+#   1. Vervang 996376 (2x, in de resource_template-URLs) door je eigen
+#      VRM installatie-id (zichtbaar in de URL van vrm.victronenergy.com).
+#   2. Zet je VRM-token in secrets.yaml als:  vrm_token: "Token <jouw token>"
+#      (de volledige headerwaarde, inclusief het woord Token).
+#   3. Vervang het EnergyZero config_entry-id (zoek op config_entry:) door dat
+#      van jouw EnergyZero-integratie (Instellingen -> Integraties, of via
+#      backup van config_entries).
+# =============================================================================
+# Victron VRM + EnergyZero — gegenereerd vanuit ogerik-victron repo
+#
+# Interface (vast contract, gelezen door de kaarten in ha-config/vrm-view.yaml):
+#   sensor.vrm_forecast_raw
+#     total_solar_yield     [[ts_ms, kWh], ...]  gerealiseerde zon per uur
+#     solar_yield_forecast  [[ts_ms, kWh], ...]  voorspelde zon per uur (API levert Wh, hier /1000)
+#     total_consumption     [[ts_ms, kWh], ...]  gerealiseerd verbruik per uur
+#     vrm_consumption_fc    [[ts_ms, kWh], ...]  voorspeld verbruik per uur (API levert Wh, hier /1000)
+#   sensor.vrm_dess
+#     soc_plan      [[ts_ms, %], ...]   gepland accu-SOC per uur
+#     cost_savings  [[ts_ms, €], ...]   per uur: export×deGs − import×deGb (+ = besparing)
+#     battery_flow  [[ts_ms, kWh], ...] accu-stroom per uur, + = LADEN, − = ONTLADEN.
+#                   VRM's total_battery_flow hanteert al precies die conventie
+#                   (empirisch bewezen 2026-07-29: +5.30 kWh om 13:00 terwijl het
+#                   SOC-plan 26→94% steeg; −7.17 kWh om 20:00 terwijl 99→59% daalde),
+#                   dus de "normalisatie" is een pass-through.
+#     total_result / net_saving / battery_costs / grid_costs   totalen in €, GEKOZEN dag
+#   sensor.energieprijzen
+#     prices  [{"timestamp": "YYYY-MM-DD HH:MM:SS+00:00", "price": €/kWh}, ...]
+#     state = huidige uurprijs in €/kWh
+#   input_datetime.vrm_datum — de gekozen dag (datumkiezer op het VRM-dashboard)
+#   binary_sensor.vrm_datum_is_vandaag — on als de gekozen dag vandaag is (of de input leeg/unknown)
+#   script.vrm_naar_vandaag — zet de datumkiezer terug op vandaag
+#
+# API-venster volgt de gekozen datum: gekozen dag − 1 dag 00:00 (lokaal) t/m
+# gekozen dag + 2 dagen 00:00 — 3 dagen. Bij "vandaag" dekt dat gisteren 00:00
+# t/m morgen 24:00: genoeg voor alle kaarten inclusief de Planning-grafiek (36 u).
+# Staat de input op unknown/unavailable, dan valt alles terug op vandaag.
+# De vier €-totalen op sensor.vrm_dess sommeren over de GEKOZEN dag 00:00–24:00;
+# de reeks-attributes (soc_plan, cost_savings, battery_flow) blijven het volledige
+# 3-daagse venster, de grafieken clippen zelf op hun x-as.
+#
+# Timestamps in de reeksen: Unix-milliseconden, zoals de VRM API ze levert.
+# Bron-endpoints en veldnamen: docs/vrm-api.md in de ogerik-victron repo.
+
+# De raw-sensoren dragen ~9 KB aan attributes per update; niet opnemen in de
+# recorder-database. De interface-sensoren blijven wel gewoon gelogd.
+recorder:
+  exclude:
+    entities:
+      - sensor.vrm_forecast_fc_raw
+      - sensor.vrm_dess_raw
+
+# Datumkiezer voor het VRM-dashboard: alle kaarten in vrm-view.yaml volgen deze datum.
+input_datetime:
+  vrm_datum:
+    name: VRM datum
+    has_date: true
+    has_time: false
+    icon: mdi:calendar
+
+# Knop "Vandaag" op het dashboard roept dit script aan.
+script:
+  vrm_naar_vandaag:
+    alias: VRM naar vandaag
+    icon: mdi:calendar-today
+    mode: single
+    sequence:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.vrm_datum
+        data:
+          date: "{{ now().date() }}"
+
+automation:
+  # Datumwissel → beide REST-sensoren meteen verversen (resource_template rendert
+  # opnieuw met het nieuwe venster); de data volgt daardoor binnen seconden in
+  # plaats van pas bij de volgende 15-min-poll.
+  - id: vrm_datum_ververst_raw_sensoren
+    alias: "VRM: datumwissel ververst raw-sensoren"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_datetime.vrm_datum
+    actions:
+      - action: homeassistant.update_entity
+        target:
+          entity_id:
+            - sensor.vrm_forecast_fc_raw
+            - sensor.vrm_dess_raw
+  # Eerste run / na restore: input_datetime restored naar unknown → op vandaag zetten.
+  - id: vrm_datum_init_bij_start
+    alias: "VRM: datum op vandaag bij HA-start als hij unknown is"
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: template
+        value_template: "{{ states('input_datetime.vrm_datum') in ['unknown', 'unavailable'] }}"
+    actions:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.vrm_datum
+        data:
+          date: "{{ now().date() }}"
+
+rest:
+  # Endpoint 1 — forecast: voorspelde zon + verbruik per uur.
+  # Venster: gekozen datum − 1 dag 00:00 (lokaal) t/m gekozen datum + 2 dagen 00:00
+  # (fallback vandaag als de datumkiezer unknown is). strptime op de input-state
+  # geeft een naïeve datetime; as_timestamp interpreteert die als LOKALE tijd.
+  # De ±86400/172800-secondenrekensom kan op een DST-grens een uur verschuiven;
+  # onschuldig, want VRM levert uur-buckets en de grafieken clippen zelf.
+  # Let op: waarden in Wh; normalisatie naar kWh gebeurt in sensor.vrm_forecast_raw hieronder.
+  - resource_template: >-
+      {%- set p = strptime(states('input_datetime.vrm_datum'), '%Y-%m-%d', none) -%}
+      {%- set base = (as_timestamp(p) if p is not none else as_timestamp(today_at())) | int -%}
+      https://vrmapi.victronenergy.com/v2/installations/996376/stats?type=forecast&interval=hours&start={{ base - 86400 }}&end={{ base + 172800 }}
+    headers:
+      # Let op: het secret moet de VOLLEDIGE headerwaarde "Token <token>" bevatten;
+      # een kaal token geeft een stille 401.
+      x-authorization: !secret vrm_token
+    scan_interval: 900
+    sensor:
+      - name: "VRM forecast fc raw"
+        unique_id: vrm_forecast_fc_raw
+        value_template: "{{ now().isoformat() }}"
+        # Bij een error-body (401/5xx/429) wordt de sensor unavailable; de not_to-guards
+        # op de template-triggers hieronder houden dan de laatste goede data vast.
+        availability: "{{ value_json is defined and value_json.records is defined }}"
+        json_attributes_path: "$.records"
+        json_attributes:
+          - solar_yield_forecast
+          - vrm_consumption_fc
+
+  # Endpoint 3 — dynamic_ess: SOC-plan, prijzen, accukosten en gerealiseerde stromen.
+  # Zelfde venster als hierboven: gekozen datum − 1 dag t/m gekozen datum + 2 dagen.
+  # Bevat ook de gerealiseerde kWh-reeksen (zelfde als type=custom).
+  - resource_template: >-
+      {%- set p = strptime(states('input_datetime.vrm_datum'), '%Y-%m-%d', none) -%}
+      {%- set base = (as_timestamp(p) if p is not none else as_timestamp(today_at())) | int -%}
+      https://vrmapi.victronenergy.com/v2/installations/996376/stats?type=dynamic_ess&interval=hours&start={{ base - 86400 }}&end={{ base + 172800 }}
+    headers:
+      # Let op: het secret moet de VOLLEDIGE headerwaarde "Token <token>" bevatten;
+      # een kaal token geeft een stille 401.
+      x-authorization: !secret vrm_token
+    scan_interval: 900
+    sensor:
+      - name: "VRM DESS raw"
+        unique_id: vrm_dess_raw
+        value_template: "{{ now().isoformat() }}"
+        # Bij een error-body (401/5xx/429) wordt de sensor unavailable; de not_to-guards
+        # op de template-triggers hieronder houden dan de laatste goede data vast.
+        availability: "{{ value_json is defined and value_json.records is defined }}"
+        json_attributes_path: "$.records"
+        json_attributes:
+          - vrm_soc_plan
+          - deGb
+          - deGs
+          - deBc
+          - grid_history_from
+          - grid_history_to
+          - total_battery_flow
+          - total_solar_yield
+          - total_consumption
+
+template:
+  # ---- Datum-hulpsensor: is de gekozen dag vandaag? ----
+  # Stuurt de conditional-kaarten ("Prijs nu", Planning) op het dashboard.
+  # Ook on bij unknown/leeg: dan geldt de fallback "vandaag" van het hele package.
+  # State-based template met now() → HA her-rendert hem elke minuut, dus ook de
+  # middernacht-omslag wordt vanzelf opgepikt.
+  - binary_sensor:
+      - name: "VRM datum is vandaag"
+        unique_id: vrm_datum_is_vandaag
+        icon: mdi:calendar-check
+        state: >-
+          {% set s = states('input_datetime.vrm_datum') %}
+          {{ s in ['unknown', 'unavailable', ''] or s == now().date() | string }}
+
+  # ---- Interface 1: sensor.vrm_forecast_raw (normalisatie Wh -> kWh) ----
+  - trigger:
+      - trigger: state
+        entity_id:
+          - sensor.vrm_forecast_fc_raw
+          - sensor.vrm_dess_raw
+        not_to:
+          - unknown
+          - unavailable
+    sensor:
+      - name: "VRM forecast raw"
+        unique_id: vrm_forecast_raw
+        state: "{{ now().isoformat() }}"
+        attributes:
+          total_solar_yield: "{{ state_attr('sensor.vrm_dess_raw', 'total_solar_yield') or [] }}"
+          total_consumption: "{{ state_attr('sensor.vrm_dess_raw', 'total_consumption') or [] }}"
+          solar_yield_forecast: >-
+            {% set ns = namespace(out=[]) %}
+            {% for p in (state_attr('sensor.vrm_forecast_fc_raw', 'solar_yield_forecast') or []) %}
+              {% set v = (p[1] / 1000) | round(3) if p[1] is not none else none %}
+              {% set ns.out = ns.out + [[p[0], v]] %}
+            {% endfor %}
+            {{ ns.out }}
+          vrm_consumption_fc: >-
+            {% set ns = namespace(out=[]) %}
+            {% for p in (state_attr('sensor.vrm_forecast_fc_raw', 'vrm_consumption_fc') or []) %}
+              {% set v = (p[1] / 1000) | round(3) if p[1] is not none else none %}
+              {% set ns.out = ns.out + [[p[0], v]] %}
+            {% endfor %}
+            {{ ns.out }}
+
+  # ---- Interface 2: sensor.vrm_dess (SOC-plan, accu-flow + afgeleide €-reeks en €-totalen) ----
+  # Formules uit docs/vrm-api.md ("€-tegels"): per uur export×deGs − import×deGb;
+  # accukosten = som deBc over uren met accugebruik (uren aanwezig in total_battery_flow).
+  # De €-totalen sommeren over de GEKOZEN dag 00:00–24:00 (t0_ms/t1_ms, fallback
+  # vandaag) — zo tonen de vier €-tegels op het dashboard automatisch de juiste
+  # dag. cost_savings, soc_plan en battery_flow blijven bewust de volledige reeksen.
+  # Extra trigger op de datumkiezer: bij een datumwissel rekenen de totalen direct
+  # opnieuw (kort €0 als het venster nog niet gedekt is; de automation hierboven
+  # ververst de raw-sensor binnen seconden en dan klopt alles weer).
+  - trigger:
+      - trigger: state
+        entity_id: sensor.vrm_dess_raw
+        not_to:
+          - unknown
+          - unavailable
+      - trigger: state
+        entity_id: input_datetime.vrm_datum
+    action:
+      - variables:
+          t0_ms: >-
+            {% set p = strptime(states('input_datetime.vrm_datum'), '%Y-%m-%d', none) %}
+            {{ (((as_timestamp(p) if p is not none else as_timestamp(today_at()))) * 1000) | int }}
+          t1_ms: "{{ (t0_ms | int) + 86400000 }}"
+          gh_from: "{{ state_attr('sensor.vrm_dess_raw', 'grid_history_from') or [] }}"
+          gh_to: "{{ state_attr('sensor.vrm_dess_raw', 'grid_history_to') or [] }}"
+          de_gb: "{{ state_attr('sensor.vrm_dess_raw', 'deGb') or [] }}"
+          de_gs: "{{ state_attr('sensor.vrm_dess_raw', 'deGs') or [] }}"
+          de_bc: "{{ state_attr('sensor.vrm_dess_raw', 'deBc') or [] }}"
+          bat_flow: "{{ state_attr('sensor.vrm_dess_raw', 'total_battery_flow') or [] }}"
+          cs: >-
+            {# Null-prijs telt als €0 (bewuste benadering); ontbrekende verkoopprijs
+               valt terug op de inkoopprijs van dat uur (deGb en deGs zijn in de
+               praktijk identiek). #}
+            {% set ns = namespace(out=[]) %}
+            {% for p in de_gb %}
+              {% set ts = p[0] %}
+              {% set buy = p[1] if p[1] is not none else 0 %}
+              {% set sell = de_gs | selectattr('0', 'eq', ts) | map(attribute='1') | select('ne', none) | first | default(buy) %}
+              {% set imp = gh_from | selectattr('0', 'eq', ts) | map(attribute='1') | select('ne', none) | first | default(none) %}
+              {% set exp = gh_to | selectattr('0', 'eq', ts) | map(attribute='1') | select('ne', none) | first | default(none) %}
+              {% if imp is not none or exp is not none %}
+                {% set ns.out = ns.out + [[ts, ((exp | default(0, true)) * sell - (imp | default(0, true)) * buy) | round(4)]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out }}
+          # De drie totalen hieronder: alleen uren van de gekozen dag (t0_ms <= ts < t1_ms).
+          saving: >-
+            {% set ns = namespace(t=0.0) %}
+            {% for p in gh_to if p[1] is not none and p[0] >= t0_ms | int and p[0] < t1_ms | int %}
+              {% set price = de_gs | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.t = ns.t + p[1] * price %}
+            {% endfor %}
+            {{ ns.t | round(2) }}
+          gcosts: >-
+            {% set ns = namespace(t=0.0) %}
+            {% for p in gh_from if p[1] is not none and p[0] >= t0_ms | int and p[0] < t1_ms | int %}
+              {% set price = de_gb | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.t = ns.t + p[1] * price %}
+            {% endfor %}
+            {{ ns.t | round(2) }}
+          bcosts: >-
+            {% set ns = namespace(t=0.0) %}
+            {% for p in bat_flow if p[1] is not none and p[0] >= t0_ms | int and p[0] < t1_ms | int %}
+              {% set c = de_bc | selectattr('0', 'eq', p[0]) | map(attribute='1') | select('ne', none) | first | default(0) %}
+              {% set ns.t = ns.t + c %}
+            {% endfor %}
+            {{ ns.t | round(2) }}
+    sensor:
+      - name: "VRM DESS"
+        unique_id: vrm_dess
+        state: "{{ states('sensor.vrm_dess_raw') }}"
+        attributes:
+          soc_plan: "{{ state_attr('sensor.vrm_dess_raw', 'vrm_soc_plan') or [] }}"
+          cost_savings: "{{ cs }}"
+          # + = laden, − = ontladen (VRM's eigen conventie, zie package-header).
+          battery_flow: "{{ state_attr('sensor.vrm_dess_raw', 'total_battery_flow') or [] }}"
+          total_result: "{{ ((saving | float(0)) - (gcosts | float(0)) - (bcosts | float(0))) | round(2) }}"
+          net_saving: "{{ saving | float(0) }}"
+          battery_costs: "{{ bcosts | float(0) }}"
+          grid_costs: "{{ gcosts | float(0) }}"
+
+  # ---- Interface 3: sensor.energieprijzen (day-ahead uurprijzen via EnergyZero/ANWB) ----
+  - trigger:
+      # Uurprijzen: elk uur verversen volstaat (plus één keer bij HA-start).
+      - trigger: time_pattern
+        minutes: 0
+      - trigger: homeassistant
+        event: start
+    action:
+      - action: energyzero.get_energy_prices
+        data:
+          # Entry-ID van de EnergyZero-integratie (ANWB); verandert als de
+          # integratie ooit wordt verwijderd en opnieuw toegevoegd.
+          config_entry: 01KYMQD8NKG9D00ANZ42RPN24D
+          incl_vat: true
+          # venster vandaag 00:00 t/m morgen 23:59 (lokaal): na publicatie (~15:00)
+          # bevat de lijst ook de uurprijzen van morgen
+          start: "{{ now().replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S') }}"
+          end: "{{ (now() + timedelta(days=1)).replace(hour=23, minute=59, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S') }}"
+        response_variable: result
+    sensor:
+      - name: "Energieprijzen"
+        unique_id: energieprijzen
+        unit_of_measurement: "€/kWh"
+        state: >-
+          {% set ns = namespace(p=none) %}
+          {% for e in (result.prices if result is defined and result.prices is defined else []) %}
+            {% if as_datetime(e.timestamp) <= now() %}{% set ns.p = e.price %}{% endif %}
+          {% endfor %}
+          {{ ns.p }}
+        attributes:
+          prices: "{{ result.prices if result is defined and result.prices is defined else [] }}"

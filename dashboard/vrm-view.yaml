@@ -1,0 +1,317 @@
+# ============================= AANPASSEN =====================================
+# Deze view komt uit github.com/ogerik/hass-vrm. Vervang deze entiteiten door
+# je eigen sensoren:
+#   - sensor.victronsystem_battery_soc100  -> jouw accu-SOC-sensor (live lijn)
+#   - sensor.p1_meter_energie_export / sensor.p1_meter_energy_import
+#                                          -> jouw slimme-meter dagtellers
+#   - sensor.zonneproductie_dag_gefilterd  -> jouw zonneproductie-dagteller
+# Vereist via HACS: apexcharts-card en config-template-card.
+# =============================================================================
+# VRM-view voor het eigen zijbalk-dashboard "victron-vrm".
+# Pushen met: python3 apply_dashboard.py victron-vrm ha-config/vrm-view.yaml
+# Databronnen: sensor.vrm_forecast_raw / sensor.vrm_dess / sensor.energieprijzen
+# (interface-contract in ha-config/packages/victron_vrm.yaml) + live SOC via modbus.
+# Reeksen zijn [[ts_ms, waarde], ...]; de ts-guard vangt eventuele seconden af.
+#
+# Layout: sections (niet masonry) — masonry strooide de kaarten ongelijk over
+# kolommen op desktop en gaf een rommelige kop op mobiel. Drie secties:
+# Installatie gegevens / Dynamic ESS / Planning; op mobiel stapelen ze in die
+# volgorde, op desktop staan ze naast elkaar met uitgelijnde bovenkanten.
+#
+# Dag-keuze: input_datetime.vrm_datum (echte datumkiezer, bovenin sectie 1).
+# Elke datum-afhankelijke kaart is gewikkeld in custom:config-template-card:
+# de variabele d = aantal dagen dat de gekozen datum vóór vandaag ligt
+# (0 = vandaag; geklemd op >= 0 zodat een toekomstdatum als vandaag rendert;
+# fallback 0 bij unknown/lege input). Daarmee schuift span.offset (ApexCharts)
+# of period.calendar.offset (statistic-kaarten) mee. De entities-lijst per
+# wrapper bevat de datum + de data-sensoren van die kaart (re-render-tracking).
+# d=0-gedrag, empirisch vastgesteld (2026-07-29): span.offset "-0d" is GELDIG —
+# apexcharts-card eist alleen een '+'/'-'-prefix en parst de rest met
+# parse-duration ("-0d" → 0 ms).
+# De package-attributes beslaan 3 dagen rond de gekozen datum (−1d .. +2d);
+# de grafieken clippen zelf op hun x-venster.
+title: VRM
+path: vrm
+icon: mdi:sine-wave
+type: sections
+max_columns: 3
+sections:
+  # ============ Sectie 1: dag-keuze + installatie gegevens ============
+  - type: grid
+    cards:
+      # Compacte kop: alleen het datumveld (terug naar vandaag = datum kiezen;
+      # script.vrm_naar_vandaag bestaat nog in het package voor automations)
+      - type: entities
+        grid_options: { columns: full }
+        entities:
+          - entity: input_datetime.vrm_datum
+            name: Dag
+
+      # -- Forecast: zon + verbruik (balken, voorspelling doorzichtig) + accu-SOC --
+      # De voorspellings-series filteren op ts >= nu en zijn op een historische dag
+      # dus vanzelf leeg; de accu-SOC-lijn komt uit de recorder-history van die dag.
+      - type: custom:config-template-card
+        grid_options: { columns: full }
+        variables:
+          d: >-
+            (() => { const s = ((states['input_datetime.vrm_datum'] || {}).state || '');
+            const t = new Date(s + 'T00:00:00').getTime();
+            return isNaN(t) ? 0 : Math.max(0, Math.round((new Date().setHours(0,0,0,0) - t) / 86400000)); })()
+        entities:
+          - input_datetime.vrm_datum
+          - sensor.vrm_forecast_raw
+          - sensor.vrm_dess
+        card:
+          type: custom:apexcharts-card
+          graph_span: 24h
+          span:
+            start: day
+            offset: "${'-' + d + 'd'}"
+          now: { show: true, label: Nu }
+          header: { show: true, title: Installatie gegevens }
+          # legend_value uit: zes series met live-waardes maken de legenda op mobiel twee regels ruis
+          all_series_config:
+            show: { legend_value: false }
+          apex_config:
+            chart: { height: 340 }
+            plotOptions:
+              bar: { columnWidth: "85%" }
+          yaxis:
+            - id: kwh
+              min: 0
+              apex_config: { title: { text: kWh } }
+            - id: soc
+              opposite: true
+              min: 0
+              max: 100
+              apex_config: { title: { text: "%" } }
+          series:
+            - entity: sensor.vrm_forecast_raw
+              name: Zon
+              type: column
+              yaxis_id: kwh
+              color: "#f7a600"
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                const now = Date.now();
+                return (entity.attributes.total_solar_yield || []).filter(p => ts(p[0]) < now).map(p => [ts(p[0]), p[1]]);
+            - entity: sensor.vrm_forecast_raw
+              name: Zon voorspelling
+              type: column
+              yaxis_id: kwh
+              color: "#f7a600"
+              opacity: 0.35
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                const now = Date.now();
+                return (entity.attributes.solar_yield_forecast || []).filter(p => ts(p[0]) >= now).map(p => [ts(p[0]), p[1]]);
+            - entity: sensor.vrm_forecast_raw
+              name: Verbruik
+              type: column
+              yaxis_id: kwh
+              color: "#e8556d"
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                const now = Date.now();
+                return (entity.attributes.total_consumption || []).filter(p => ts(p[0]) < now).map(p => [ts(p[0]), p[1]]);
+            - entity: sensor.vrm_forecast_raw
+              name: Verbruik voorspelling
+              type: column
+              yaxis_id: kwh
+              color: "#e8556d"
+              opacity: 0.35
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                const now = Date.now();
+                return (entity.attributes.vrm_consumption_fc || []).filter(p => ts(p[0]) >= now).map(p => [ts(p[0]), p[1]]);
+            - entity: sensor.victronsystem_battery_soc100
+              name: Accu
+              type: line
+              yaxis_id: soc
+              color: "#3b7cff"
+              group_by: { func: avg, duration: 30min }
+            - entity: sensor.vrm_dess
+              name: Accu plan
+              type: line
+              yaxis_id: soc
+              color: "#3b7cff"
+              stroke_dash: 4
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                const now = Date.now();
+                return (entity.attributes.soc_plan || []).filter(p => ts(p[0]) >= now).map(p => [ts(p[0]), p[1]]);
+
+      # -- Dag-totalen: period.calendar.offset = -d (getal) --
+      # "Prijs nu" alleen bij vandaag (conditional in de 4e cel).
+      - type: custom:config-template-card
+        grid_options: { columns: full }
+        variables:
+          d: >-
+            (() => { const s = ((states['input_datetime.vrm_datum'] || {}).state || '');
+            const t = new Date(s + 'T00:00:00').getTime();
+            return isNaN(t) ? 0 : Math.max(0, Math.round((new Date().setHours(0,0,0,0) - t) / 86400000)); })()
+        entities:
+          - input_datetime.vrm_datum
+          - binary_sensor.vrm_datum_is_vandaag
+        card:
+          type: grid
+          columns: 2
+          square: false
+          cards:
+            - type: statistic
+              entity: sensor.p1_meter_energie_export
+              period:
+                calendar:
+                  period: day
+                  offset: "${-d}"
+              stat_type: change
+              name: Naar net
+            - type: statistic
+              entity: sensor.p1_meter_energy_import
+              period:
+                calendar:
+                  period: day
+                  offset: "${-d}"
+              stat_type: change
+              name: Van net
+            # stat_type change (niet max): de sensor is total_increasing, daarvoor bestaat
+            # geen max-statistiek en toont de kaart "?".
+            - type: statistic
+              entity: sensor.zonneproductie_dag_gefilterd
+              period:
+                calendar:
+                  period: day
+                  offset: "${-d}"
+              stat_type: change
+              name: Totaal zon
+            - type: conditional
+              conditions:
+                - condition: state
+                  entity: binary_sensor.vrm_datum_is_vandaag
+                  state: "on"
+              card:
+                type: entity
+                entity: sensor.energieprijzen
+                name: Prijs nu
+
+  # ============ Sectie 2: Dynamic ESS — kosten en besparingen ============
+  - type: grid
+    cards:
+      # + Accu-lijn (kWh, rechteras): + = laden, − = ontladen. Zo zie je of de accu
+      # laadt op de groene/goedkope uren en ontlaadt op de dure uren.
+      - type: custom:config-template-card
+        grid_options: { columns: full }
+        variables:
+          d: >-
+            (() => { const s = ((states['input_datetime.vrm_datum'] || {}).state || '');
+            const t = new Date(s + 'T00:00:00').getTime();
+            return isNaN(t) ? 0 : Math.max(0, Math.round((new Date().setHours(0,0,0,0) - t) / 86400000)); })()
+        entities:
+          - input_datetime.vrm_datum
+          - sensor.vrm_dess
+        card:
+          type: custom:apexcharts-card
+          graph_span: 24h
+          span:
+            start: day
+            offset: "${'-' + d + 'd'}"
+          now: { show: true, label: Nu }
+          header: { show: true, title: Dynamic ESS — kosten en besparingen }
+          # legend_value uit: twee series met live-waardes = ruis op mobiel
+          all_series_config:
+            show: { legend_value: false }
+          apex_config:
+            chart: { height: 260 }
+            plotOptions:
+              bar:
+                columnWidth: "85%"
+                colors:
+                  ranges:
+                    - { from: -1000, to: 0, color: "#e8556d" }
+                    - { from: 0, to: 1000, color: "#5fbf77" }
+          yaxis:
+            - id: euro
+              apex_config: { title: { text: "€" } }
+            - id: kwh
+              opposite: true
+              apex_config: { title: { text: "kWh" } }
+          series:
+            - entity: sensor.vrm_dess
+              name: Resultaat
+              type: column
+              unit: "€"
+              # kleur alleen voor het legenda-bolletje; de balken zelf kleuren via de ranges
+              color: "#5fbf77"
+              yaxis_id: euro
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                return (entity.attributes.cost_savings || []).map(p => [ts(p[0]), p[1]]);
+            - entity: sensor.vrm_dess
+              name: Accu
+              type: line
+              unit: kWh
+              yaxis_id: kwh
+              color: "#3b7cff"
+              data_generator: |
+                const ts = t => t < 1e12 ? t*1000 : t;
+                return (entity.attributes.battery_flow || []).map(p => [ts(p[0]), p[1]]);
+
+      # -- €-totalen: volgen de GEKOZEN dag (package filtert op het datumvenster) --
+      # Uitleg als korte vaste subregel (geen hover-tooltip: werkt niet op mobiel);
+      # kort gehouden zodat de vier tegels gelijk van hoogte blijven.
+      - type: markdown
+        grid_options: { columns: 6 }
+        content: "**Totaal resultaat**\n\n# € {{ state_attr('sensor.vrm_dess','total_result') }}\n\n*Besparing − netkosten − accukosten.*"
+      - type: markdown
+        grid_options: { columns: 6 }
+        content: "**Net besparing**\n\n# € {{ state_attr('sensor.vrm_dess','net_saving') }}\n\n*Verdiend met terugleveren aan het net.*"
+      - type: markdown
+        grid_options: { columns: 6 }
+        content: "**Accu kosten**\n\n# € {{ state_attr('sensor.vrm_dess','battery_costs') }}\n\n*Slijtagetarief uit VRM voor accugebruik.*"
+      - type: markdown
+        grid_options: { columns: 6 }
+        content: "**Net kosten**\n\n# € {{ state_attr('sensor.vrm_dess','grid_costs') }}\n\n*Betaald voor inkoop van het net.*"
+
+  # ============ Sectie 3: Planning (alleen bij vandaag) ============
+  # Een voorspelling terugkijken heeft geen zin; hele sectie verbergt zichzelf.
+  - type: grid
+    visibility:
+      - condition: state
+        entity: binary_sensor.vrm_datum_is_vandaag
+        state: "on"
+    cards:
+      - type: custom:apexcharts-card
+        grid_options: { columns: full }
+        graph_span: 36h
+        span: { start: day }
+        now: { show: true, label: Nu }
+        header: { show: true, title: Planning — prijs en accu }
+        apex_config:
+          chart: { height: 260 }
+        yaxis:
+          - id: prijs
+            apex_config: { title: { text: "€/kWh" } }
+          - id: soc
+            opposite: true
+            min: 0
+            max: 100
+            apex_config: { title: { text: "%" } }
+        series:
+          - entity: sensor.energieprijzen
+            name: Prijs
+            type: line
+            curve: stepline
+            yaxis_id: prijs
+            color: "#7d5fb2"
+            data_generator: |
+              // energyzero-timestamp "YYYY-MM-DD HH:MM:SS+00:00" → ISO zodat new Date() hem parst
+              return (entity.attributes.prices || []).map(p => [new Date(p.timestamp.replace(' ', 'T')).getTime(), p.price]);
+          - entity: sensor.vrm_dess
+            name: Accu plan
+            type: line
+            yaxis_id: soc
+            color: "#3b7cff"
+            stroke_dash: 4
+            data_generator: |
+              const ts = t => t < 1e12 ? t*1000 : t;
+              return (entity.attributes.soc_plan || []).map(p => [ts(p[0]), p[1]]);
