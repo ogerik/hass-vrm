@@ -1,0 +1,236 @@
+# ============================= AANPASSEN =====================================
+# Eigen verbruiksvoorspelling voor Victron Dynamic ESS.
+#   1. Zet je VRM installatie-id bij vrm_site (zoek op vrm_site:), één plek.
+#   2. Zelfde secret als victron_vrm.yaml:  vrm_token: "Token <jouw token>"
+#   3. Na herstart/herladen in HA invullen:
+#        - DESS: daggroepen      bijv. "ma,di,wo,do,vr|za,zo" (leeg = dat)
+#        - DESS: vakantiedagen   bijv. "2026-10-10/2026-10-16, 2026-12-24/2026-12-31"
+#        - DESS: data vanaf      oudere dagen tellen niet mee (optioneel)
+#      en zet daarna "DESS: eigen verbruiksvoorspelling" aan.
+# =============================================================================
+# Waarom: VRM voorspelt verbruik uit een meerweeks gemiddelde. Eén drukke dag
+# (EV laden, logés) of een vakantie trekt dat weken scheef, en DESS houdt dan
+# accu achter voor verbruik dat niet komt. Een 60e percentiel over de laatste
+# 6 vergelijkbare dagen is ongevoelig voor zulke uitschieters (backtest op één
+# installatie: VRM +11,1 kWh/dag te hoog, dit profiel -0,4 kWh/dag).
+#
+# Hoe: elk uur haalt de automation hieronder 6 weken uurverbruik op
+# (type=kwh, Gc + Bc + Pc = verbruik uit net + accu + zon), rekent per uur een
+# profiel uit en stuurt de komende 36 uur naar POST /adjust-consumption. Dat is
+# hetzelfde als het potlood bij "Verbruik" in de VRM-app; DESS rekent vanaf het
+# volgende kwartier met deze waarden. Het lopende uur kan VRM niet aanpassen.
+# Uitzetten zet de komende 48 uur terug naar VRM's eigen voorspelling
+# (value -1 = reset).
+#
+# Beperkingen:
+#   - Alleen de totale voorspelling wordt aangepast. Heeft je installatie in
+#     VRM een aparte EV-lader- of warmtepompvoorspelling, dan zit dat verbruik
+#     hier in het totaal; VRM's splitsing klopt dan niet meer met het totaal.
+#   - Meet VRM je zon niet (geen PV-meter/omvormer gekoppeld), dan is het
+#     verbruik netto (zon al afgetrokken). DESS plant dan ook zonder zon, dus
+#     dat is consistent. Verandert dat (meter erbij of weer online), zet dan
+#     "data vanaf" op die datum, anders mengt het profiel netto en bruto dagen.
+
+input_boolean:
+  dess_verbruik_sturen:
+    name: "DESS: eigen verbruiksvoorspelling"
+    icon: mdi:chart-bell-curve
+  dess_vakantie:
+    name: "DESS: vakantie"
+    icon: mdi:palm-tree
+
+input_text:
+  # Groepen gescheiden door |, dagen door komma's. Dagen in dezelfde groep
+  # gelden als vergelijkbaar. ma di wo do vr za zo (of mo tu we th fr sa su).
+  # Niet genoemde dagen vormen elk een eigen groep. Leeg = ma,di,wo,do,vr|za,zo.
+  #   ma,di,wo,do,vr|za,zo        werkdag / weekend
+  #   ma,di,do|wo,vr|za,zo        bijv. iemand thuis op wo en vr
+  #   ma|di|wo|do|vr|za|zo        elke dag apart (heeft veel weken data nodig)
+  dess_daggroepen:
+    name: "DESS: daggroepen"
+    max: 100
+  # Komma-gescheiden reeksen "JJJJ-MM-DD/JJJJ-MM-DD". Deze dagen tellen niet
+  # mee in het normale profiel. Staat "DESS: vakantie" aan, dan wordt juist
+  # het profiel van deze dagen gebruikt.
+  dess_vakantiedagen:
+    name: "DESS: vakantiedagen"
+    max: 255
+
+input_datetime:
+  dess_data_vanaf:
+    name: "DESS: data vanaf"
+    has_date: true
+    has_time: false
+
+rest_command:
+  vrm_verbruik_historie:
+    url: >-
+      https://vrmapi.victronenergy.com/v2/installations/{{ site }}/stats?type=kwh&interval=hours&start={{ start }}&end={{ end }}
+    method: get
+    headers:
+      x-authorization: !secret vrm_token
+    timeout: 30
+  vrm_verbruik_aanpassen:
+    url: https://vrmapi.victronenergy.com/v2/installations/{{ site }}/adjust-consumption
+    method: post
+    headers:
+      x-authorization: !secret vrm_token
+    content_type: application/json
+    # body komt als object binnen (HA parseert gerenderde JSON), dus hier
+    # pas omzetten naar JSON-tekst.
+    payload: "{{ body | to_json }}"
+    timeout: 30
+
+automation:
+  - id: dess_verbruik_profiel_sturen
+    alias: "DESS - Eigen verbruiksvoorspelling naar VRM"
+    description: >-
+      Elk uur: rekent per uur het 60e percentiel uit over de laatste 6
+      vergelijkbare dagen (zonder vakantiedagen) en stuurt de komende 36 uur
+      naar VRM Dynamic ESS. Uitzetten zet de voorspelling terug naar VRM.
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: 5
+      - trigger: state
+        entity_id:
+          - input_boolean.dess_verbruik_sturen
+          - input_boolean.dess_vakantie
+          - input_text.dess_daggroepen
+          - input_text.dess_vakantiedagen
+          - input_datetime.dess_data_vanaf
+      - trigger: homeassistant
+        event: start
+    action:
+      - variables:
+          # AANPASSEN: je VRM installatie-id.
+          vrm_site: 996376
+          # 6 vergelijkbare dagen, 60e percentiel: beste combinatie in de
+          # backtest. Hoger percentiel = voorzichtiger (meer accu achterhouden).
+          n: 6
+          p: 0.6
+          uren: 36
+      - if:
+          - condition: state
+            entity_id: input_boolean.dess_verbruik_sturen
+            state: "off"
+        then:
+          # Alleen terugzetten bij het uitzetten zelf, niet elk uur opnieuw.
+          - condition: template
+            value_template: >-
+              {{ trigger.platform == 'state' and trigger.entity_id == 'input_boolean.dess_verbruik_sturen' }}
+          - action: rest_command.vrm_verbruik_aanpassen
+            data:
+              site: "{{ vrm_site }}"
+              body: >-
+                {%- set uur0 = as_timestamp(now().replace(minute=0, second=0, microsecond=0)) | int -%}
+                {%- set l = namespace(v=[]) -%}
+                {%- for i in range(1, 49) -%}
+                  {%- set l.v = l.v + [{'timestamp': uur0 + i * 3600, 'value': -1}] -%}
+                {%- endfor -%}
+                {{ {'vrm_consumption_fc_adj': l.v} | to_json }}
+          - stop: "Uitgezet: voorspelling teruggezet naar VRM"
+      - action: rest_command.vrm_verbruik_historie
+        data:
+          site: "{{ vrm_site }}"
+          start: "{{ (as_timestamp(today_at()) - 42 * 86400) | int }}"
+          end: "{{ as_timestamp(today_at()) | int }}"
+        response_variable: historie
+      - condition: template
+        value_template: >-
+          {{ historie.status == 200 and historie.content is mapping and historie.content.records is defined }}
+      - variables:
+          body: >-
+            {%- set rec = historie.content.records -%}
+            {%- set gc = dict(rec.Gc) if rec.Gc is list else {} -%}
+            {%- set bc = dict(rec.Bc) if rec.Bc is list else {} -%}
+            {%- set pc = dict(rec.Pc) if rec.Pc is list else {} -%}
+            {%- set vakantie = is_state('input_boolean.dess_vakantie', 'on') -%}
+            {%- set vanaf = states('input_datetime.dess_data_vanaf') -%}
+            {%- set vanaf = vanaf if vanaf | regex_match('^\d{4}-\d{2}-\d{2}$') else '0000-00-00' -%}
+            {#- daggroepen: weekdag (0 = maandag) -> groepnummer -#}
+            {%- set dagnr = {'ma': 0, 'di': 1, 'wo': 2, 'do': 3, 'vr': 4, 'za': 5, 'zo': 6,
+                             'mo': 0, 'tu': 1, 'we': 2, 'th': 3, 'fr': 4, 'sa': 5, 'su': 6} -%}
+            {%- set spec = states('input_text.dess_daggroepen') | lower -%}
+            {%- set gm = namespace(m={}) -%}
+            {%- for grp in spec.split('|') -%}
+              {%- set gi = loop.index0 -%}
+              {%- for dn in grp.split(',') if (dn | trim)[:2] in dagnr -%}
+                {%- set gm.m = dict(gm.m, **{(dagnr[(dn | trim)[:2]] | string): gi}) -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {%- if gm.m | count == 0 -%}
+              {%- set gm.m = {'0': 0, '1': 0, '2': 0, '3': 0, '4': 0, '5': 1, '6': 1} -%}
+            {%- endif -%}
+            {#- vakantiedagen uit "JJJJ-MM-DD/JJJJ-MM-DD, ..." -#}
+            {%- set vk = namespace(d=[]) -%}
+            {%- for r in states('input_text.dess_vakantiedagen').split(',') if '/' in r -%}
+              {%- set a = strptime(r.split('/')[0] | trim, '%Y-%m-%d', none) -%}
+              {%- set b = strptime(r.split('/')[1] | trim, '%Y-%m-%d', none) -%}
+              {%- if a is not none and b is not none and 0 <= (b - a).days <= 90 -%}
+                {%- for i in range((b - a).days + 1) -%}
+                  {%- set vk.d = vk.d + [(a + timedelta(days=i)).strftime('%Y-%m-%d')] -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set out = namespace(l=[]) -%}
+            {%- set uur0 = now().replace(minute=0, second=0, microsecond=0) -%}
+            {%- for i in range(1, uren + 1) -%}
+              {%- set t = uur0 + timedelta(hours=i) -%}
+              {%- set g = gm.m.get(t.weekday() | string, 100 + t.weekday()) -%}
+              {%- set k = namespace(v=[]) -%}
+              {%- for back in range(1, 43) if k.v | count < n -%}
+                {%- set d = today_at() - timedelta(days=back) -%}
+                {%- set ds = d.strftime('%Y-%m-%d') -%}
+                {%- set dg = gm.m.get(d.weekday() | string, 100 + d.weekday()) -%}
+                {%- if ds >= vanaf and dg == g and ((ds in vk.d) if vakantie else (ds not in vk.d)) -%}
+                  {%- set ts = (as_timestamp(d.replace(hour=t.hour)) * 1000) | int -%}
+                  {%- set k.v = k.v + [gc.get(ts, 0) + bc.get(ts, 0) + pc.get(ts, 0)] -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {#- Te weinig vergelijkbare dagen: dit uur niet aanpassen, VRM houdt zijn eigen waarde. -#}
+              {%- if k.v | count >= 3 -%}
+                {%- set s = k.v | sort -%}
+                {%- set x = (s | count - 1) * p -%}
+                {%- set lo = x | int -%}
+                {%- set hi = [lo + 1, s | count - 1] | min -%}
+                {%- set kwh = s[lo] + (s[hi] - s[lo]) * (x - lo) -%}
+                {%- set out.l = out.l + [{'timestamp': as_timestamp(t) | int, 'value': (kwh * 1000) | round(0) | int}] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ {'vrm_consumption_fc_adj': out.l} | to_json }}
+      - condition: template
+        value_template: "{{ body.vrm_consumption_fc_adj | count > 0 }}"
+      - action: rest_command.vrm_verbruik_aanpassen
+        data:
+          site: "{{ vrm_site }}"
+          body: "{{ body }}"
+        response_variable: resultaat
+      - event: dess_verbruik_verstuurd
+        event_data:
+          ok: "{{ resultaat.status == 200 }}"
+          uren: "{{ body.vrm_consumption_fc_adj }}"
+
+template:
+  # Laat op het dashboard zien wat er het laatst naar VRM is gestuurd.
+  # state = som van de komende 24 uur in kWh.
+  - trigger:
+      - trigger: event
+        event_type: dess_verbruik_verstuurd
+    sensor:
+      - name: "DESS verbruik voorspelling"
+        unique_id: dess_verbruik_voorspelling
+        unit_of_measurement: kWh
+        icon: mdi:chart-bell-curve
+        state: >-
+          {{ ((trigger.event.data.uren[:24] | map(attribute='value') | sum) / 1000) | round(1) }}
+        attributes:
+          ok: "{{ trigger.event.data.ok }}"
+          verstuurd: "{{ now().isoformat() }}"
+          # [[ts_ms, kWh], ...], zelfde vorm als vrm_consumption_fc in sensor.vrm_forecast_raw
+          uren: >-
+            {%- set l = namespace(v=[]) -%}
+            {%- for x in trigger.event.data.uren -%}
+              {%- set l.v = l.v + [[x.timestamp * 1000, x.value / 1000]] -%}
+            {%- endfor -%}
+            {{ l.v }}
